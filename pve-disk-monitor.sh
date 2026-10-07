@@ -1,59 +1,59 @@
 #!/usr/bin/env bash
 #
-# pve-disk-monitor.sh - disk-monitoring voor Proxmox VE hosts (alleen de host, geen VM's/LXC)
+# pve-disk-monitor.sh - disk health monitoring for Proxmox VE hosts (host only, no VMs/LXC)
 #
-# Controleert lokale en USB-disks en meldt naar een Uptime Kuma *push* monitor
-# (en optioneel een generieke JSON-webhook). Elke run stuurt een heartbeat:
-#   status=up   -> alles OK (of alleen waarschuwingen, zie [kuma] down_severity)
-#   status=down -> problemen; msg bevat een samenvatting
-# Stopt het script met draaien, dan gaat de Kuma push monitor vanzelf down.
+# Checks local and USB disks and reports to an Uptime Kuma *push* monitor
+# (and optionally a generic JSON webhook). Every run sends a heartbeat:
+#   status=up   -> everything OK (or warnings only, see [kuma] down_severity)
+#   status=down -> problems; msg contains a summary
+# If the script stops running, the Kuma push monitor goes down by itself.
 #
-# Checks (te kiezen via [general] checks):
-#   disks    verdwenen / opnieuw verbonden / verwachte disks (USB-disconnects)
-#   smart    SMART-status, reallocated/pending sectors, CRC-fouten, temperatuur, NVMe-slijtage
-#   kernel   I/O-fouten, USB-resets, link-resets, fs-fouten in de kernellog sinds vorige run
-#   mounts   verwachte mountpoints: gemount, niet read-only, schrijfbaar, niet hangend
-#   usage    vulgraad + inodes van lokale filesystems
-#   zfs      pool-health, fouten, capaciteit
-#   lvmthin  thin pool data/metadata vulgraad
-#   mdraid   degraded md-arrays
-#   btrfs    btrfs device-foutentellers
-#   pvesm    lokale Proxmox-storages die inactive zijn
+# Checks (select via [general] checks):
+#   disks    disappeared / reconnected / expected disks (USB disconnects)
+#   smart    SMART status, reallocated/pending sectors, CRC errors, temperature, NVMe wear
+#   kernel   I/O errors, USB resets, link resets, fs errors in the kernel log since the last run
+#   mounts   expected mountpoints: mounted, not read-only, writable, not hanging
+#   usage    space and inode usage of local filesystems
+#   zfs      pool health, errors, capacity
+#   lvmthin  thin pool data/metadata usage
+#   mdraid   degraded md arrays
+#   btrfs    btrfs device error counters
+#   pvesm    local Proxmox storages that are inactive
 #
-# Gebruik: pve-disk-monitor.sh [opties]
-#   -c, --config FILE   ini-bestand (standaard /etc/pve-disk-monitor.ini)
-#   -n, --dry-run       niets versturen, geen state bijwerken; toont wat er verstuurd zou worden
-#   -v, --verbose       ook INFO-meldingen tonen
-#       --list-disks    gevonden disks + identifiers tonen (handig voor [disks] expected)
-#       --test-alert    stuur een test-melding (down) naar Kuma/webhook
-#       --forget KEY    disk (serial/key) vergeten zodat hij niet meer als verdwenen gemeld wordt
-#       --reset-known   lijst bekende disks wissen (volgende run leert opnieuw)
+# Usage: pve-disk-monitor.sh [options]
+#   -c, --config FILE   INI file (default /etc/pve-disk-monitor.ini)
+#   -n, --dry-run       send nothing, update no state; print what would be sent
+#   -v, --verbose       also print INFO messages
+#       --list-disks    list detected disks + identifiers (useful for [disks] expected)
+#       --test-alert    send a test alert (down) to Kuma/webhook
+#       --forget KEY    forget a disk (serial/key) so it is no longer reported missing
+#       --reset-known   clear the list of known disks (next run learns again)
 #
-# Exitcode: 0 = OK, 1 = waarschuwingen, 2 = kritiek, 3 = scriptfout
+# Exit code: 0 = OK, 1 = warnings, 2 = critical, 3 = script error
 #
-# Vereist: bash 4.4+, jq, curl, smartmontools (>= 7.0), util-linux
+# Requires: bash 4.4+, jq, curl, smartmontools (>= 7.0), util-linux
 
 set -uo pipefail
 umask 077
 export LC_ALL=C
 
-VERSION="1.0"
+VERSION="1.1"
 SCRIPT_NAME=$(basename "$0")
 
 # ======================================================================
-# Standaardinstellingen (overschrijfbaar via het ini-bestand)
+# Defaults (can be overridden in the INI file)
 # ======================================================================
 CONFIG_FILE="/etc/pve-disk-monitor.ini"
 
 # [general]
 CHECKS="disks smart kernel mounts usage zfs lvmthin mdraid btrfs pvesm"
 STATE_DIR="/var/lib/pve-disk-monitor"
-HOST_LABEL=""                       # leeg = hostname -s
+HOST_LABEL=""                       # empty = hostname -s
 MAX_MSG_LEN=900
 
 # [kuma]
 KUMA_PUSH_URL=""
-KUMA_DOWN_SEVERITY="WARN"           # WARN: down bij warn+crit | CRIT: alleen down bij crit
+KUMA_DOWN_SEVERITY="WARN"           # WARN: down on warn+crit | CRIT: down on crit only
 KUMA_TIMEOUT=20
 
 # [webhook]
@@ -74,7 +74,7 @@ SMART_NOWAKE=1
 SMART_SKIP_REGEX=""
 SMART_UNSUPPORTED="INFO"            # INFO | WARN
 SMART_USB_TRY_TYPES=(sat sntjmicron sntasmedia sntrealtek)
-SMART_EXTRA=()                      # "device|type|label", bv. "/dev/sda|megaraid,0|bay0"
+SMART_EXTRA=()                      # "device|type|label", e.g. "/dev/sda|megaraid,0|bay0"
 ATTR_WARN_ABOVE="5:0 187:0 197:0 198:0"
 ATTR_CRIT_INCREASE="5 197 198"
 ATTR_WARN_INCREASE="187 199"
@@ -84,7 +84,7 @@ TEMP_SSD="60 70"
 TEMP_NVME="70 80"
 NVME_WEAR_WARN=90
 NVME_MEDIA_WARN_ABOVE=0
-declare -A SMART_DEVTYPE=()         # [smart.devtype] serial/naam = type
+declare -A SMART_DEVTYPE=()         # [smart.devtype] serial/name = type
 
 # [kernel]
 KERNEL_LOOKBACK=3600
@@ -150,7 +150,7 @@ ACTION_ARG=""
 CRIT=()
 WARN=()
 INFO=()
-STANDBY_RC=3        # exitcode die smartctl -n standby,N teruggeeft als de disk slaapt
+STANDBY_RC=3        # exit code smartctl -n standby,N returns when the disk is asleep
 
 die()  { echo "$SCRIPT_NAME: $*" >&2; exit 3; }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -176,7 +176,7 @@ join_by() {
   printf '%s' "$out"
 }
 
-# level WAARDE WARN CRIT -> print CRIT/WARN/niets (werkt ook met decimalen)
+# level VALUE WARN CRIT -> prints CRIT/WARN/nothing (also works with decimals)
 level() {
   awk -v v="$1" -v w="$2" -v c="$3" 'BEGIN {
     if (v !~ /^[0-9]+(\.[0-9]+)?$/) exit
@@ -204,18 +204,18 @@ safe_name() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
 
 urlencode() { jq -rn --arg s "$1" '$s | @uri'; }
 
-# Lijstwaarde: komma- of spatiegescheiden -> array-elementen
+# List value: comma- or space-separated -> array elements
 split_list() { local IFS=$', \t'; read -r -a _LIST <<<"$1"; }
 
 bool() {
   case ${1,,} in
-    1|yes|y|true|on|ja) echo 1 ;;
+    1|yes|y|true|on) echo 1 ;;
     *) echo 0 ;;
   esac
 }
 
 # ======================================================================
-# INI-parser (geen source/eval: alleen bekende sleutels worden gezet)
+# INI parser (no source/eval: only known keys are set)
 # ======================================================================
 ini_set() {
   local sec=$1 key=$2 val=$3 where=$4
@@ -287,13 +287,13 @@ ini_set() {
     pvesm.types_regex)              PVESM_TYPES_REGEX=$val ;;
     pvesm.ignore_regex)             PVESM_IGNORE_REGEX=$val ;;
 
-    *) echo "$SCRIPT_NAME: onbekende instelling [$sec] $key ($where)" >&2 ;;
+    *) echo "$SCRIPT_NAME: unknown setting [$sec] $key ($where)" >&2 ;;
   esac
 }
 
-# Regels: [sectie], key = waarde. Commentaar: regels die met ; of # beginnen
-# (geen inline-commentaar, zodat regexen # en ; mogen bevatten).
-# Waarden mogen tussen "..." of '...' staan. Herhaalbare sleutels: zie voorbeeld-ini.
+# Lines: [section], key = value. Comments: lines starting with ; or #
+# (no inline comments, so regexes may contain # and ;).
+# Values may be wrapped in "..." or '...'. Repeatable keys: see the example INI.
 load_ini() {
   local file=$1 line sec="" key val n=0
   while IFS= read -r line || [[ -n $line ]]; do
@@ -306,7 +306,7 @@ load_ini() {
       continue
     fi
     if [[ $line != *=* ]]; then
-      echo "$SCRIPT_NAME: $file:$n: ongeldige regel genegeerd" >&2
+      echo "$SCRIPT_NAME: $file:$n: invalid line ignored" >&2
       continue
     fi
     key=$(trim "${line%%=*}")
@@ -314,7 +314,7 @@ load_ini() {
     if [[ ${#val} -ge 2 && ( ( $val == \"*\" ) || ( $val == \'*\' ) ) ]]; then
       val=${val:1:${#val}-2}
     fi
-    # in [smart.devtype] / [usage.thresholds] is de sleutel een serial/pad -> hoofdletters behouden
+    # in [smart.devtype] / [usage.thresholds] the key is a serial/path -> keep case
     case $sec in
       smart.devtype|usage.thresholds) ini_set "$sec" "$key" "$val" "$file:$n" ;;
       *) ini_set "$sec" "${key,,}" "$val" "$file:$n" ;;
@@ -323,20 +323,20 @@ load_ini() {
 }
 
 # ======================================================================
-# Disk-inventaris
+# Disk inventory
 # ======================================================================
 declare -A D_NAME=() D_TRAN=() D_MODEL=() D_SERIAL=() D_WWN=() D_LABEL=() N2K=()
 DISK_KEYS=()
 
 scan_disks() {
   local json name tran serial model size wwn key
-  json=$(lsblk -J -d -o NAME,TYPE,TRAN,SERIAL,MODEL,SIZE,WWN 2>/dev/null) || die "lsblk faalde"
+  json=$(lsblk -J -d -o NAME,TYPE,TRAN,SERIAL,MODEL,SIZE,WWN 2>/dev/null) || die "lsblk failed"
   while IFS=$'\t' read -r name tran serial model size wwn; do
     [[ $name =~ $DISK_EXCLUDE_REGEX ]] && continue
     key=$serial
     [[ $key == - ]] && key=$wwn
     [[ $key == - ]] && key="$name:$model:$size"
-    # sommige USB-behuizingen geven dezelfde serial voor meerdere disks
+    # some USB enclosures report the same serial for multiple disks
     [[ -n ${D_NAME[$key]+x} ]] && key="$key:$name"
     DISK_KEYS+=("$key")
     D_NAME[$key]=$name
@@ -353,7 +353,7 @@ scan_disks() {
 }
 
 # ======================================================================
-# Check: disks (verdwenen / reconnect / verwacht)
+# Check: disks (disappeared / reconnected / expected)
 # ======================================================================
 track_this() { # tran
   case $TRACK_DISKS in
@@ -381,21 +381,21 @@ check_disks() {
       track_this "${K_TRAN[$key]}" || continue
       if [[ -z ${D_NAME[$key]+x} ]]; then
         if [[ -n $TRACK_IGNORE_REGEX && "$key ${K_MODEL[$key]} ${K_NAME[$key]}" =~ $TRACK_IGNORE_REGEX ]]; then
-          info "Disk niet aanwezig (genegeerd): ${K_MODEL[$key]} SN $key"
+          info "Disk not present (ignored): ${K_MODEL[$key]} SN $key"
         else
-          crit "Disk verdwenen: ${K_MODEL[$key]} SN $key (was /dev/${K_NAME[$key]}, ${K_TRAN[$key]})"
+          crit "Disk disappeared: ${K_MODEL[$key]} SN $key (was /dev/${K_NAME[$key]}, ${K_TRAN[$key]})"
         fi
       elif (( WARN_ON_RENAME )) && [[ ${K_NAME[$key]} != "${D_NAME[$key]}" && -n $prev_boot && $boot_id == "$prev_boot" ]]; then
-        warn "Disk opnieuw verbonden? ${D_LABEL[$key]} was /dev/${K_NAME[$key]}"
+        warn "Disk reconnected? ${D_LABEL[$key]} was /dev/${K_NAME[$key]}"
       fi
     done
 
     for key in "${DISK_KEYS[@]}"; do
       track_this "${D_TRAN[$key]}" || continue
-      [[ -z ${K_NAME[$key]+x} && ${#K_NAME[@]} -gt 0 ]] && info "Nieuwe disk: ${D_LABEL[$key]}"
+      [[ -z ${K_NAME[$key]+x} && ${#K_NAME[@]} -gt 0 ]] && info "New disk: ${D_LABEL[$key]}"
       out+="$key"$'\t'"${D_NAME[$key]}"$'\t'"${D_TRAN[$key]}"$'\t'"${D_MODEL[$key]}"$'\n'
     done
-    # ontbrekende disks onthouden zodat de melding blijft staan tot ze terug zijn (of --forget)
+    # keep missing disks so the alert stays until they are back (or --forget)
     for key in "${!K_NAME[@]}"; do
       [[ -z ${D_NAME[$key]+x} ]] && track_this "${K_TRAN[$key]}" &&
         out+="$key"$'\t'"${K_NAME[$key]}"$'\t'"${K_TRAN[$key]}"$'\t'"${K_MODEL[$key]}"$'\n'
@@ -413,7 +413,7 @@ check_disks() {
     done
     (( found )) || [[ -e /dev/disk/by-id/$exp ]] && found=1
     (( found )) || [[ $exp == /dev/* && -e $exp ]] && found=1
-    (( found )) || crit "Verwachte disk ontbreekt: $exp"
+    (( found )) || crit "Expected disk missing: $exp"
   done
 }
 
@@ -435,15 +435,15 @@ smart_run() { # device type
 
 smart_has_data() { jq -e '.smart_status.passed != null' <<<"$SMART_JSON" >/dev/null 2>&1; }
 
-# 0 = data aanwezig, 1 = geen data, 2 = afgehandeld (slaapt / timeout)
+# 0 = data present, 1 = no data, 2 = handled (asleep / timeout)
 smart_status_after_run() {
   local label=$1
   if (( SMART_RC == 124 )); then
-    crit "smartctl timeout op $label (disk hangt?)"
+    crit "smartctl timeout on $label (disk hanging?)"
     return 2
   fi
   if (( SMART_NOWAKE && SMART_RC == STANDBY_RC )); then
-    info "$label slaapt, SMART overgeslagen"
+    info "$label is asleep, SMART skipped"
     return 2
   fi
   smart_has_data && return 0
@@ -463,7 +463,7 @@ smart_one() { # device type label statekey tran
   fi
   (( rc == 2 )) && return
   if (( rc == 1 )); then
-    report_level "$SMART_UNSUPPORTED" "Geen SMART-data voor $label (bridge ondersteunt het niet? zet [smart.devtype])"
+    report_level "$SMART_UNSUPPORTED" "No SMART data for $label (bridge not supported? set [smart.devtype])"
     return
   fi
 
@@ -494,16 +494,16 @@ smart_one() { # device type label statekey tran
   done < <(state_get "$sfile")
 
   [[ ${S[passed]:-} == false ]] && crit "SMART FAILED: $label"
-  [[ -n ${S[failing]:-} ]] && crit "SMART attribuut onder drempel op $label: ${S[failing]}"
-  [[ ${S[selftest]:-} == false ]] && warn "Laatste SMART self-test mislukt: $label"
+  [[ -n ${S[failing]:-} ]] && crit "SMART attribute below threshold on $label: ${S[failing]}"
+  [[ ${S[selftest]:-} == false ]] && warn "Last SMART self-test failed: $label"
 
-  # ATA-attributen: stijging t.o.v. vorige run, en drempels
-  local id cur prev spec max aname
+  # ATA attributes: increase since the previous run, and thresholds
+  local id cur prev spec max
   local -A seen=()
   for id in $ATTR_CRIT_INCREASE; do
     cur=${S[a$id]:-}; prev=${P[a$id]:-}
     if isnum "$cur" && isnum "$prev" && (( cur > prev )); then
-      crit "$label: ${S[n$id]:-attr $id} gestegen $prev -> $cur"
+      crit "$label: ${S[n$id]:-attr $id} increased $prev -> $cur"
       seen[$id]=1
     fi
   done
@@ -511,7 +511,7 @@ smart_one() { # device type label statekey tran
     [[ -n ${seen[$id]:-} ]] && continue
     cur=${S[a$id]:-}; prev=${P[a$id]:-}
     if isnum "$cur" && isnum "$prev" && (( cur > prev )); then
-      warn "$label: ${S[n$id]:-attr $id} gestegen $prev -> $cur"
+      warn "$label: ${S[n$id]:-attr $id} increased $prev -> $cur"
       seen[$id]=1
     fi
   done
@@ -527,7 +527,7 @@ smart_one() { # device type label statekey tran
 
   cur=${S[errlog]:-}; prev=${P[errlog]:-}
   if [[ $ATA_ERRLOG_INCREASE != IGNORE ]] && isnum "$cur" && isnum "$prev" && (( cur > prev )); then
-    report_level "$ATA_ERRLOG_INCREASE" "$label: ATA error log $prev -> $cur fouten"
+    report_level "$ATA_ERRLOG_INCREASE" "$label: ATA error log $prev -> $cur errors"
   fi
 
   # NVMe
@@ -536,17 +536,17 @@ smart_one() { # device type label statekey tran
     isnum "$cur" && (( cur != 0 )) && crit "$label: NVMe critical_warning=$(printf '0x%02x' "$cur")"
     cur=${S[nvme_media]:-}; prev=${P[nvme_media]:-}
     if isnum "$cur" && isnum "$prev" && (( cur > prev )); then
-      crit "$label: NVMe media errors gestegen $prev -> $cur"
+      crit "$label: NVMe media errors increased $prev -> $cur"
     elif isnum "$cur" && (( cur > NVME_MEDIA_WARN_ABOVE )); then
       warn "$label: NVMe media errors = $cur"
     fi
     cur=${S[nvme_used]:-}
-    isnum "$cur" && (( cur >= NVME_WEAR_WARN )) && warn "$label: NVMe slijtage ${cur}%"
+    isnum "$cur" && (( cur >= NVME_WEAR_WARN )) && warn "$label: NVMe wear ${cur}%"
     cur=${S[nvme_spare]:-}; prev=${S[nvme_spare_th]:-}
     isnum "$cur" && isnum "$prev" && (( cur < prev )) && crit "$label: NVMe available spare ${cur}% < ${prev}%"
   fi
 
-  # Temperatuur
+  # Temperature
   local tw tc kind
   if [[ ${S[isnvme]:-} == true ]]; then
     kind=NVMe; read -r tw tc <<<"$TEMP_NVME"
@@ -556,7 +556,7 @@ smart_one() { # device type label statekey tran
     kind=HDD; read -r tw tc <<<"$TEMP_HDD"
   fi
   cur=${S[temp]:-}
-  report_level "$(level "$cur" "$tw" "$tc")" "$label: temperatuur ${cur}°C ($kind, max $tw/$tc)"
+  report_level "$(level "$cur" "$tw" "$tc")" "$label: temperature ${cur}°C ($kind, max $tw/$tc)"
 
   local st=""
   for k in "${!S[@]}"; do
@@ -566,7 +566,7 @@ smart_one() { # device type label statekey tran
 }
 
 check_smart() {
-  have smartctl || { warn "smartctl niet gevonden (apt install smartmontools)"; return; }
+  have smartctl || { warn "smartctl not found (apt install smartmontools)"; return; }
   local key name devtype e dev t lbl
   for key in "${DISK_KEYS[@]}"; do
     name=${D_NAME[$key]}
@@ -584,10 +584,10 @@ check_smart() {
 }
 
 # ======================================================================
-# Check: kernellog
+# Check: kernel log
 # ======================================================================
 check_kernel() {
-  have journalctl || { warn "journalctl niet beschikbaar"; return; }
+  have journalctl || { warn "journalctl not available"; return; }
   local since boot_ts s2 pat ign lines="" n devs="" d last r a b
   local -a all=() ranges=()
 
@@ -595,8 +595,8 @@ check_kernel() {
   isnum "$since" || since=$((RUN_START - KERNEL_LOOKBACK))
   boot_ts=$((RUN_START - $(cut -d. -f1 /proc/uptime)))
 
-  # Kernelmeldingen in de eerste KERNEL_BOOT_GRACE seconden na boot overslaan
-  # (USB-resets/link-meldingen bij het opstarten), maar wel de vorige boot meenemen.
+  # Skip kernel messages in the first KERNEL_BOOT_GRACE seconds after boot
+  # (USB resets/link messages during startup), but still check the previous boot.
   if (( since < boot_ts )); then
     ranges+=("$since $boot_ts")
     s2=$((boot_ts + KERNEL_BOOT_GRACE))
@@ -635,7 +635,7 @@ check_kernel() {
 
   local sev=$KERNEL_SEVERITY
   (( n >= KERNEL_CRIT_COUNT )) && sev=CRIT
-  report_level "$sev" "Kernel: $n disk-/IO-fout(en) ${devs:+[$(trim "$devs")] }laatste: $last"
+  report_level "$sev" "Kernel: $n disk/IO error(s) ${devs:+[$(trim "$devs")] }last: $last"
 }
 
 # ======================================================================
@@ -646,39 +646,39 @@ check_mounts() {
   for m in "${EXPECTED_MOUNTS[@]}"; do
     timeout "$MOUNT_TIMEOUT" mountpoint -q -- "$m"; rc=$?
     if (( rc == 124 )); then
-      crit "Mount $m reageert niet (hangt)"
+      crit "Mount $m not responding (hanging)"
       continue
     elif (( rc != 0 )); then
-      crit "Niet gemount: $m"
+      crit "Not mounted: $m"
       continue
     fi
     opts=$(findmnt -n -o OPTIONS --mountpoint "$m" 2>/dev/null | head -n 1)
     if [[ ",$opts," == *,ro,* ]]; then
-      crit "Read-only gemount: $m"
+      crit "Mounted read-only: $m"
       continue
     fi
     if (( MOUNT_WRITE_TEST )); then
       f="$m/.pve-disk-monitor.test"
       if ! timeout "$MOUNT_TIMEOUT" sh -c 'printf "%s\n" "$2" > "$1" && rm -f -- "$1"' _ "$f" "$RUN_START" 2>/dev/null; then
-        crit "Schrijftest mislukt op $m"
+        crit "Write test failed on $m"
       fi
     fi
   done
 }
 
 # ======================================================================
-# Check: vulgraad filesystems
+# Check: filesystem usage
 # ======================================================================
 check_usage() {
   local out rc src fst pc ipc tgt w c
   out=$(timeout 30 df -l --output=source,fstype,pcent,ipcent,target 2>/dev/null); rc=$?
-  (( rc == 124 )) && { crit "df hangt (filesystem reageert niet)"; return; }
+  (( rc == 124 )) && { crit "df hanging (filesystem not responding)"; return; }
   while read -r src fst pc ipc tgt; do
     [[ $fst =~ $USAGE_FSTYPES_REGEX ]] || continue
     [[ -n $USAGE_EXCLUDE_REGEX && $tgt =~ $USAGE_EXCLUDE_REGEX ]] && continue
     read -r w c <<<"${USAGE_THRESHOLDS[$tgt]:-$USAGE_WARN $USAGE_CRIT}"
-    report_level "$(level "${pc%\%}" "$w" "$c")" "Filesystem $tgt ($src) ${pc} vol"
-    report_level "$(level "${ipc%\%}" "$INODE_WARN" "$INODE_CRIT")" "Filesystem $tgt ($src) inodes ${ipc} vol"
+    report_level "$(level "${pc%\%}" "$w" "$c")" "Filesystem $tgt ($src) ${pc} full"
+    report_level "$(level "${ipc%\%}" "$INODE_WARN" "$INODE_CRIT")" "Filesystem $tgt ($src) inodes ${ipc} used"
   done < <(tail -n +2 <<<"$out")
 }
 
@@ -697,10 +697,10 @@ check_zfs() {
       if [[ -n $errs && $errs != "No known data errors" ]]; then
         crit "ZFS pool $name: $errs"
       elif [[ $health == ONLINE ]]; then
-        warn "ZFS pool $name: ${stat:-niet healthy}"
+        warn "ZFS pool $name: ${stat:-not healthy}"
       fi
     fi
-    report_level "$(level "${cap%\%}" "$ZFS_CAP_WARN" "$ZFS_CAP_CRIT")" "ZFS pool $name ${cap} vol"
+    report_level "$(level "${cap%\%}" "$ZFS_CAP_WARN" "$ZFS_CAP_CRIT")" "ZFS pool $name ${cap} full"
   done < <(timeout 30 zpool list -H -o name,health,capacity 2>/dev/null)
 }
 
@@ -713,8 +713,8 @@ check_lvmthin() {
   while IFS='|' read -r vg lv attr d m; do
     vg=$(trim "$vg")
     [[ $attr == t* ]] || continue
-    report_level "$(level "$d" "$THIN_DATA_WARN" "$THIN_DATA_CRIT")" "LVM thin $vg/$lv data ${d}% vol"
-    report_level "$(level "$m" "$THIN_META_WARN" "$THIN_META_CRIT")" "LVM thin $vg/$lv metadata ${m}% vol"
+    report_level "$(level "$d" "$THIN_DATA_WARN" "$THIN_DATA_CRIT")" "LVM thin $vg/$lv data ${d}% full"
+    report_level "$(level "$m" "$THIN_META_WARN" "$THIN_META_CRIT")" "LVM thin $vg/$lv metadata ${m}% full"
   done < <(timeout 30 lvs --noheadings --nosuffix --separator '|' -o vg_name,lv_name,lv_attr,data_percent,metadata_percent 2>/dev/null)
 }
 
@@ -729,7 +729,7 @@ check_mdraid() {
   done < <(awk '
     /^md[0-9]+ :/ { dev = $1
       if ($3 == "inactive") print dev " is inactive"
-      if ($0 ~ /\(F\)/) print dev " heeft een failed member" }
+      if ($0 ~ /\(F\)/) print dev " has a failed member" }
     /\[[U_]+\]$/ && $NF ~ /_/ { print dev " degraded " $NF }' /proc/mdstat)
 }
 
@@ -743,7 +743,7 @@ check_btrfs() {
     [[ -n $mnt ]] || continue
     mnt=$(printf '%b' "$mnt")
     out=$(timeout 30 btrfs device stats --check "$mnt" 2>&1) && continue
-    warn "btrfs fouten op $mnt: $(grep -vE '[[:space:]]0$' <<<"$out" | head -n 3 | tr '\n' ' ')"
+    warn "btrfs errors on $mnt: $(grep -vE '[[:space:]]0$' <<<"$out" | head -n 3 | tr '\n' ' ')"
   done < <(findmnt -rn -t btrfs -o UUID,TARGET 2>/dev/null | awk '!s[$1]++ { print $2 }')
 }
 
@@ -763,7 +763,7 @@ check_pvesm() {
 }
 
 # ======================================================================
-# Melden
+# Reporting
 # ======================================================================
 send_kuma() { # status msg ping
   [[ -z $KUMA_PUSH_URL ]] && return 0
@@ -774,7 +774,7 @@ send_kuma() { # status msg ping
   fi
   curl -fsS -m "$KUMA_TIMEOUT" --retry 3 --retry-delay 5 -o /dev/null \
     "$base?status=$1&msg=$(urlencode "$2")&ping=$3" ||
-    echo "$SCRIPT_NAME: Uptime Kuma push mislukt" >&2
+    echo "$SCRIPT_NAME: Uptime Kuma push failed" >&2
 }
 
 send_webhook() { # status msg force
@@ -785,7 +785,7 @@ send_webhook() { # status msg force
   prev=$(state_get webhook_hash)
   if [[ $3 != 1 ]] && (( WEBHOOK_ON_CHANGE_ONLY )); then
     [[ $hash == "$prev" ]] && return 0
-    # eerste run en alles OK: niet melden, alleen onthouden
+    # first run and all OK: do not notify, just remember
     [[ -z $prev && $1 == up ]] && { state_put webhook_hash "$hash"; return 0; }
   fi
   crit_json=$(printf '%s\n' "${CRIT[@]}" | jq -R . | jq -sc 'map(select(length > 0))')
@@ -803,7 +803,7 @@ send_webhook() { # status msg force
        -d "$payload" "$WEBHOOK_URL"; then
     state_put webhook_hash "$hash"
   else
-    echo "$SCRIPT_NAME: webhook mislukt" >&2
+    echo "$SCRIPT_NAME: webhook failed" >&2
   fi
 }
 
@@ -821,7 +821,7 @@ report() { # [force]
   if (( rc == 0 )); then
     msg="OK - ${#DISK_KEYS[@]} disks, checks: $CHECKS"
   elif [[ $status == up ]]; then
-    msg="OK met waarschuwingen - $(join_by ' | ' "${parts[@]}")"
+    msg="OK with warnings - $(join_by ' | ' "${parts[@]}")"
   else
     msg="$HOST: $(join_by ' | ' "${parts[@]}")"
   fi
@@ -841,7 +841,7 @@ report() { # [force]
 }
 
 # ======================================================================
-# Acties
+# Actions
 # ======================================================================
 list_disks() {
   local key name byid
@@ -853,11 +853,11 @@ list_disks() {
     [[ $key != "${D_SERIAL[$key]}" ]] && printf '%-9s key: %s\n' "" "$key"
   done
   echo
-  echo "Bekende disks (state): $STATE_DIR/known_disks"
+  echo "Known disks (state): $STATE_DIR/known_disks"
   state_get known_disks | awk -F'\t' 'NF { printf "  %-24s %-8s %-5s %s\n", $1, $2, $3, $4 }'
 }
 
-usage() { sed -n '/^# Gebruik:/,/^# Exitcode/p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '/^# Usage:/,/^# Exit code/p' "$0" | sed 's/^# \{0,1\}//'; }
 
 # ======================================================================
 # Main
@@ -881,16 +881,16 @@ done
 if [[ -r $CONFIG_FILE ]]; then
   load_ini "$CONFIG_FILE"
 elif [[ $CONFIG_FILE != /etc/pve-disk-monitor.ini ]]; then
-  die "config niet leesbaar: $CONFIG_FILE"
+  die "config not readable: $CONFIG_FILE"
 fi
 
-(( EUID == 0 )) || die "moet als root draaien"
+(( EUID == 0 )) || die "must run as root"
 for bin in jq lsblk curl timeout findmnt; do
-  have "$bin" || die "$bin ontbreekt (apt install jq curl smartmontools)"
+  have "$bin" || die "$bin missing (apt install jq curl smartmontools)"
 done
-mkdir -p -- "$STATE_DIR" || die "kan $STATE_DIR niet aanmaken"
+mkdir -p -- "$STATE_DIR" || die "cannot create $STATE_DIR"
 exec 9>"$STATE_DIR/.lock"
-flock -n 9 || die "draait al"
+flock -n 9 || die "already running"
 
 HOST=${HOST_LABEL:-$(hostname -s)}
 RUN_START=$(date +%s)
@@ -903,14 +903,14 @@ case $ACTION in
     exit 0 ;;
   forget)
     state_put known_disks "$(state_get known_disks | awk -F'\t' -v k="$ACTION_ARG" '$1 != k')"
-    echo "Vergeten: $ACTION_ARG"
+    echo "Forgotten: $ACTION_ARG"
     exit 0 ;;
   reset)
     (( DRY_RUN )) || rm -f -- "$STATE_DIR/known_disks"
-    echo "Lijst bekende disks gewist"
+    echo "Known disks list cleared"
     exit 0 ;;
   test)
-    CRIT=("TEST-melding van $SCRIPT_NAME op $HOST - negeren")
+    CRIT=("TEST alert from $SCRIPT_NAME on $HOST - please ignore")
     report 1
     exit $? ;;
 esac
@@ -919,7 +919,7 @@ for c in $CHECKS; do
   if declare -F "check_$c" >/dev/null; then
     "check_$c"
   else
-    warn "Onbekende check in config: $c"
+    warn "Unknown check in config: $c"
   fi
 done
 

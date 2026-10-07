@@ -4,8 +4,6 @@ Disk health monitoring for **Proxmox VE hosts**, reporting to an **Uptime Kuma p
 
 A single Bash script that runs on the Proxmox host itself (not inside VMs or containers) and checks local and USB-attached disks: SMART health, disappearing/reconnecting USB disks, kernel I/O errors, filesystem usage, ZFS, LVM-thin and more. Every run pushes a heartbeat to Uptime Kuma: `up` when everything is fine, `down` with a summary of the problems when something is wrong. All settings live in a separate INI file.
 
-> **Note:** alert messages and inline comments in the script are in Dutch. This README and the configuration keys are in English.
-
 ## Features
 
 | Check     | What it detects |
@@ -270,7 +268,7 @@ Exit codes: `0` OK, `1` warnings, `2` critical, `3` script error. The systemd un
 
 ## Common scenarios
 
-**A USB disk is unplugged.** The next run reports `Disk verdwenen` ("disk disappeared") as critical. The alert remains until the disk is back. If the disk was removed on purpose, run:
+**A USB disk is unplugged.** The next run reports `Disk disappeared` as critical. The alert remains until the disk is back. If the disk was removed on purpose, run:
 
 ```bash
 pve-disk-monitor.sh --forget <serial>
