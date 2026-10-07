@@ -1,0 +1,13 @@
+[Unit]
+Description=Proxmox disk monitor (Uptime Kuma push)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pve-disk-monitor.sh
+# 1 = waarschuwingen, 2 = kritiek: geen "failed" unit daarvoor
+SuccessExitStatus=1 2
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=15min
