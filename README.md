@@ -296,3 +296,7 @@ State is stored in `/var/lib/pve-disk-monitor/`:
 - `webhook_hash`: last sent problem list
 
 Deleting the directory resets everything. The next run starts fresh.
+
+## License
+
+[MIT](LICENSE)
